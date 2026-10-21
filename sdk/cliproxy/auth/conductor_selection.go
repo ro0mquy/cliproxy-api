@@ -440,6 +440,14 @@ func (m *Manager) SetSelector(selector Selector) {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
 	}
+	m.bindSelectorAuthList(selector)
+}
+
+// bindSelectorAuthList hands the credential list to selectors that work outside Pick.
+func (m *Manager) bindSelectorAuthList(selector Selector) {
+	if binder, ok := selector.(authListBinder); ok {
+		binder.bindAuthList(m.List)
+	}
 }
 
 // Selector returns the current credential selector.

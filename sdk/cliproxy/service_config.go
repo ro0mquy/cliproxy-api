@@ -29,6 +29,7 @@ type routingRuntimeState struct {
 	sessionAffinity          bool
 	sessionAffinityTTL       time.Duration
 	sessionAffinitySubagents bool
+	cswapPolicy              coreauth.CswapPolicyConfig
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -46,6 +47,13 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		state.strategy = "weighted-round-robin"
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
+	case "cswap-policy", "cswap":
+		state.strategy = "cswap-policy"
+		state.cswapPolicy = coreauth.CswapPolicyConfig{
+			Threshold:     cfg.Routing.CswapPolicy.Threshold,
+			HysteresisPct: cfg.Routing.CswapPolicy.HysteresisPct,
+			Cooldown:      time.Duration(cfg.Routing.CswapPolicy.CooldownSeconds) * time.Second,
+		}
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
@@ -69,6 +77,8 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		selector = &coreauth.WeightedRoundRobinSelector{}
 	case "fill-first":
 		selector = &coreauth.FillFirstSelector{}
+	case "cswap-policy":
+		selector = coreauth.NewCswapPolicySelector(state.cswapPolicy)
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
