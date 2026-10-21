@@ -543,8 +543,12 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first".
+	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first",
+	// "cswap-policy" (Claude OAuth usage-aware consume-first routing).
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// CswapPolicy tunes the "cswap-policy" strategy. Zero values select the defaults.
+	CswapPolicy CswapPolicyConfig `yaml:"cswap-policy,omitempty" json:"cswap-policy,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Explicit Claude Code, Codex, OpenCode, pi, and generic (X-Session-ID) session headers
@@ -579,6 +583,22 @@ type RoutingConfig struct {
 	//     keep the binding and return the error (or retry the same credential) instead.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+}
+
+// CswapPolicyConfig tunes the "cswap-policy" routing strategy, which reads each Claude
+// OAuth account's usage windows from Anthropic and routes like the claude-swap tool.
+type CswapPolicyConfig struct {
+	// Threshold is the window utilization percent at which an account leaves rotation.
+	// Default: 95.
+	Threshold float64 `yaml:"threshold,omitempty" json:"threshold,omitempty"`
+
+	// HysteresisPct is how many points below Threshold a window must fall before the
+	// account returns to rotation. Default: 10.
+	HysteresisPct float64 `yaml:"hysteresis-pct,omitempty" json:"hysteresis-pct,omitempty"`
+
+	// CooldownSeconds is the minimum time between voluntary changes of the preferred
+	// account. Default: 300.
+	CooldownSeconds int `yaml:"cooldown-seconds,omitempty" json:"cooldown-seconds,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

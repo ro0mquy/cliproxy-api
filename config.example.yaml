@@ -167,7 +167,7 @@ access:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
+  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, cswap-policy
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
   # Sticky requests (including inherited and LCP bindings) also consume weighted credits
@@ -184,6 +184,16 @@ routing:
   # In Home mode, compatible Home versions charge retained WS turns from usage after completion;
   # CPA preserves the retained credential and concurrency slot instead of redispatching each turn.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
+  # cswap-policy polls each Claude OAuth account's 5-hour, 7-day, and per-model weekly
+  # usage from Anthropic in the background. An account leaves rotation when a window
+  # reaches the threshold and returns once that window drops hysteresis-pct below it.
+  # New sessions go to the healthy account whose 7-day window resets soonest. Pair it
+  # with session-affinity: true so conversations keep their account while it is healthy.
+  # Other providers are rotated round-robin.
+  # cswap-policy:
+  #   threshold: 95
+  #   hysteresis-pct: 10
+  #   cooldown-seconds: 300
   # Enable universal session-sticky routing for all clients.
   # Explicit Claude Code, Codex, OpenCode, pi, and generic (X-Session-ID) session headers
   # are preferred, followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
