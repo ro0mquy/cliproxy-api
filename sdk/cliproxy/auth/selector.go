@@ -1564,6 +1564,32 @@ func (s *SessionAffinitySelector) unavailableBoundAuthError(ctx context.Context,
 	}
 }
 
+// sessionEligibilityFilter is implemented by fallback selectors that take credentials
+// out of rotation for reasons the availability check does not see, such as quota
+// usage. A session binding is kept only while the filter keeps its credential.
+type sessionEligibilityFilter interface {
+	filterSessionEligible(provider, model string, auths []*Auth) []*Auth
+}
+
+// authListBinder is implemented by selectors that read credentials outside Pick.
+// The manager binds its credential list when it installs the selector.
+type authListBinder interface {
+	bindAuthList(list func() []*Auth)
+}
+
+func (s *SessionAffinitySelector) sessionEligible(provider, model string, auths []*Auth) []*Auth {
+	if filter, ok := s.fallback.(sessionEligibilityFilter); ok {
+		return filter.filterSessionEligible(provider, model, auths)
+	}
+	return auths
+}
+
+func (s *SessionAffinitySelector) bindAuthList(list func() []*Auth) {
+	if binder, ok := s.fallback.(authListBinder); ok {
+		binder.bindAuthList(list)
+	}
+}
+
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
 	Fallback         Selector
@@ -1695,6 +1721,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 	fallbackAuths := highestPriorityAuths(available)
+	// Bindings only survive on credentials the fallback still keeps in rotation. The
+	// fallback itself sees every available credential so it can account for the move.
+	available = s.sessionEligible(provider, model, available)
 
 	modelKey := canonicalModelKey(model)
 	cacheKey := provider + "::" + primaryID + "::" + modelKey
@@ -1878,7 +1907,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 
 	var preservedAuthID string
 	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
-		for _, auth := range available {
+		for _, auth := range s.sessionEligible(provider, model, available) {
 			if auth == nil || auth.ID != match.AuthID {
 				continue
 			}
@@ -2123,6 +2152,9 @@ func (s *SessionAffinitySelector) Stop() {
 	}
 	if s.matcher != nil {
 		s.matcher.Clear()
+	}
+	if stoppable, ok := s.fallback.(StoppableSelector); ok {
+		stoppable.Stop()
 	}
 }
 
