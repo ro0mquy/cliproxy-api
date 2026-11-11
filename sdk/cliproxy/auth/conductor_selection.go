@@ -755,10 +755,14 @@ func (m *Manager) SetSelector(selector Selector) {
 	m.bindSelectorAuthList(selector)
 }
 
-// bindSelectorAuthList hands the credential list to selectors that work outside Pick.
+// bindSelectorAuthList hands the credential list, and a way to clear a credential's
+// quota cooldown, to selectors that work outside Pick.
 func (m *Manager) bindSelectorAuthList(selector Selector) {
 	if binder, ok := selector.(authListBinder); ok {
-		binder.bindAuthList(m.List)
+		binder.bindAuthList(m.List, func(authID string) error {
+			_, _, errReset := m.ResetQuota(context.Background(), authID)
+			return errReset
+		})
 	}
 }
 
