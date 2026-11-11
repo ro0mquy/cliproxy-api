@@ -104,8 +104,9 @@ func (c CswapPolicyConfig) normalized() CswapPolicyConfig {
 // windows. A background poller reads GET /api/oauth/usage for each account; Pick
 // performs no I/O and decides on the last known values:
 //
-//   - A window at or above the threshold takes the account out of rotation. It
-//     returns once that window falls hysteresis points below the threshold.
+//   - A 5-hour window at or above the threshold takes the account out of
+//     rotation. It returns once that window falls hysteresis points below the
+//     threshold. Weekly windows only reset weekly, so they run to 100%.
 //   - New sessions go to a preferred account per model. While it is healthy the
 //     preferred account only moves to an account whose 7-day window resets
 //     sooner (consume-first), at most once per cooldown.
@@ -114,8 +115,10 @@ func (c CswapPolicyConfig) normalized() CswapPolicyConfig {
 //     soonest-recovery ranking.
 //
 // The selector never refreshes tokens. Accounts with an expired access token
-// are skipped until the manager refreshes them. Non-Claude credentials are
-// rotated round-robin.
+// are skipped until the manager refreshes them. When a poll shows an account in
+// a quota cooldown well below the threshold again (Anthropic reset its limits
+// early), the selector clears the cooldown. Non-Claude credentials are rotated
+// round-robin.
 type CswapPolicySelector struct {
 	cfg      CswapPolicyConfig
 	fallback *RoundRobinSelector
@@ -126,6 +129,7 @@ type CswapPolicySelector struct {
 
 	httpClient *http.Client
 	usageURL   string
+	resetQuota func(authID string) error
 	now        func() time.Time
 	randFloat  func() float64
 
@@ -212,11 +216,14 @@ func NewCswapPolicySelector(cfg CswapPolicyConfig) *CswapPolicySelector {
 }
 
 // bindAuthList starts the background usage poller over the manager's credentials.
-func (s *CswapPolicySelector) bindAuthList(list func() []*Auth) {
+func (s *CswapPolicySelector) bindAuthList(list func() []*Auth, resetQuota func(authID string) error) {
 	if s == nil || list == nil {
 		return
 	}
-	s.startOnce.Do(func() { go s.pollLoop(list) })
+	s.startOnce.Do(func() {
+		s.resetQuota = resetQuota
+		go s.pollLoop(list)
+	})
 }
 
 // Stop terminates the background usage poller.
@@ -712,18 +719,47 @@ func (s *CswapPolicySelector) pollLoop(list func() []*Auth) {
 }
 
 type cswapPollTarget struct {
-	id    string
-	token string
+	id            string
+	token         string
+	quotaCooldown bool
 }
 
 // pollOnce fetches usage for the most overdue account and records the result.
+// A quota cooldown that the fresh usage contradicts is cleared: the manager sets
+// it from a 429 until the window's reset, and Anthropic sometimes resets limits
+// early.
 func (s *CswapPolicySelector) pollOnce(auths []*Auth) {
 	target, ok := s.nextPollTarget(auths)
 	if !ok {
 		return
 	}
 	usage, kind, retryAfter, errFetch := s.fetchUsage(target.token)
-	s.recordPoll(target.id, usage, kind, retryAfter, errFetch)
+	recovered, pct := s.recordPoll(target.id, usage, kind, retryAfter, errFetch)
+	if !recovered || !target.quotaCooldown || s.resetQuota == nil {
+		return
+	}
+	if errReset := s.resetQuota(target.id); errReset != nil {
+		log.Warnf("%s: clear quota cooldown failed | auth=%s err=%v", cswapStrategyLogPrefix, target.id, errReset)
+		return
+	}
+	log.Infof("%s: cleared quota cooldown | auth=%s usage=%.1f%%", cswapStrategyLogPrefix, target.id, pct)
+}
+
+// hasCswapQuotaCooldown reports whether the manager holds the credential, or one
+// of its models, in an unexpired quota cooldown.
+func hasCswapQuotaCooldown(auth *Auth, now time.Time) bool {
+	active := func(quota QuotaState, retry time.Time) bool {
+		return quota.Exceeded && (quota.NextRecoverAt.After(now) || retry.After(now))
+	}
+	if active(auth.Quota, auth.NextRetryAfter) {
+		return true
+	}
+	for _, state := range auth.ModelStates {
+		if state != nil && active(state.Quota, state.NextRetryAfter) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *CswapPolicySelector) nextPollTarget(auths []*Auth) (cswapPollTarget, bool) {
@@ -752,7 +788,7 @@ func (s *CswapPolicySelector) nextPollTarget(auths []*Auth) (cswapPollTarget, bo
 			continue
 		}
 		if !found || acct.fetchedAt.Before(bestFetched) || (acct.fetchedAt.Equal(bestFetched) && auth.ID < best.id) {
-			best = cswapPollTarget{id: auth.ID, token: authAccessToken(auth)}
+			best = cswapPollTarget{id: auth.ID, token: authAccessToken(auth), quotaCooldown: hasCswapQuotaCooldown(auth, now)}
 			bestFetched = acct.fetchedAt
 			found = true
 		}
@@ -872,13 +908,15 @@ func parseCswapUsage(body []byte) (*cswapUsage, error) {
 	return usage, nil
 }
 
-func (s *CswapPolicySelector) recordPoll(id string, usage *cswapUsage, kind string, retryAfter *time.Duration, errFetch error) {
+// recordPoll stores a poll result. It reports whether the account is clearly
+// usable again: every window below threshold - hysteresis.
+func (s *CswapPolicySelector) recordPoll(id string, usage *cswapUsage, kind string, retryAfter *time.Duration, errFetch error) (bool, float64) {
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	acct := s.accounts[id]
 	if acct == nil {
-		return
+		return false, 0
 	}
 	if errFetch != nil {
 		acct.failures++
@@ -893,7 +931,7 @@ func (s *CswapPolicySelector) recordPoll(id string, usage *cswapUsage, kind stri
 			cause = fmt.Sprintf("%s, retry-after %.0fs", kind, retryAfter.Seconds())
 		}
 		log.Warnf("%s: usage fetch failed | auth=%s cause=%s failures=%d next_poll_in=%s", cswapStrategyLogPrefix, id, cause, acct.failures, backoff.Round(time.Second))
-		return
+		return false, 0
 	}
 	prevPct, prevKnown := acct.bindingPct()
 	prevInterval := acct.interval
@@ -905,6 +943,7 @@ func (s *CswapPolicySelector) recordPoll(id string, usage *cswapUsage, kind stri
 	acct.nextPollAt, acct.interval = s.planNextPoll(acct, prevInterval, prevPct, prevKnown, now)
 	pct, known := acct.bindingPct()
 	log.Debugf("%s: usage | auth=%s binding=%.1f known=%t windows=%d next_poll_in=%s", cswapStrategyLogPrefix, id, pct, known, len(acct.windows()), acct.nextPollAt.Sub(now).Round(time.Second))
+	return known && pct < s.cfg.Threshold-s.cfg.HysteresisPct, pct
 }
 
 func (a *cswapAccount) windows() []cswapWindow {
@@ -915,19 +954,26 @@ func (a *cswapAccount) windows() []cswapWindow {
 }
 
 // updateRotationLocked applies the threshold and hysteresis per window: a
-// window at or above the threshold takes the account out of rotation, and it
-// returns once that window drops below threshold - hysteresis.
+// window at or above its threshold takes the account out of rotation, and it
+// returns once that window drops below threshold - hysteresis. Only the 5-hour
+// window stops early at the configured threshold: it comes back within hours.
+// A weekly window comes back only at its reset, so stopping early would strand
+// its last points; it runs to 100%.
 func (s *CswapPolicySelector) updateRotationLocked(id string, acct *cswapAccount) {
 	seen := make(map[string]struct{}, len(acct.windows()))
 	for _, window := range acct.windows() {
 		seen[window.key] = struct{}{}
+		threshold := 100.0
+		if window.key == cswapWindowFiveHour {
+			threshold = s.cfg.Threshold
+		}
 		switch {
-		case !acct.out[window.key] && window.pct >= s.cfg.Threshold:
+		case !acct.out[window.key] && window.pct >= threshold:
 			acct.out[window.key] = true
-			log.Infof("%s: out of rotation | auth=%s window=%s usage=%.1f%% threshold=%.1f%%", cswapStrategyLogPrefix, id, window.key, window.pct, s.cfg.Threshold)
-		case acct.out[window.key] && window.pct < s.cfg.Threshold-s.cfg.HysteresisPct:
+			log.Infof("%s: out of rotation | auth=%s window=%s usage=%.1f%% threshold=%.1f%%", cswapStrategyLogPrefix, id, window.key, window.pct, threshold)
+		case acct.out[window.key] && window.pct < threshold-s.cfg.HysteresisPct:
 			delete(acct.out, window.key)
-			log.Infof("%s: back in rotation | auth=%s window=%s usage=%.1f%% below=%.1f%%", cswapStrategyLogPrefix, id, window.key, window.pct, s.cfg.Threshold-s.cfg.HysteresisPct)
+			log.Infof("%s: back in rotation | auth=%s window=%s usage=%.1f%% below=%.1f%%", cswapStrategyLogPrefix, id, window.key, window.pct, threshold-s.cfg.HysteresisPct)
 		}
 	}
 	for key := range acct.out {

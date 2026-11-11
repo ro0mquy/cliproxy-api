@@ -295,12 +295,11 @@ func TestCswapPolicyEveryoneAboveThreshold(t *testing.T) {
 		cswapTestAuth("c", now.Add(8*time.Hour)),
 		cswapTestAuth("d", now.Add(8*time.Hour)),
 	}
-	// Everyone is at or over 95%. a resets its 7-day window first, b's 5-hour
-	// window comes back first, c is bound by its 7-day window for days, d is at
-	// its hard limit.
+	// Every 5-hour window is at or over 95%. a resets its 7-day window first, b's
+	// 5-hour window comes back first, c's comes back last, d is at its hard limit.
 	fake.set("token-a", cswapUsageBody(97, now.Add(2*time.Hour), 60, now.Add(24*time.Hour)))
 	fake.set("token-b", cswapUsageBody(96, now.Add(30*time.Minute), 50, now.Add(4*24*time.Hour)))
-	fake.set("token-c", cswapUsageBody(20, now.Add(2*time.Hour), 99, now.Add(3*24*time.Hour)))
+	fake.set("token-c", cswapUsageBody(98, now.Add(4*time.Hour+30*time.Minute), 30, now.Add(3*24*time.Hour)))
 	fake.set("token-d", cswapUsageBody(100, now.Add(20*time.Minute), 70, now.Add(12*time.Hour)))
 	pollNow(selector, auths)
 
@@ -575,8 +574,8 @@ func TestCswapPolicySessionAffinityKeepsHealthyAccount(t *testing.T) {
 	// the preference to a, bound sessions stay on accounts that still have headroom.
 	clock.Advance(CswapDefaultCooldown)
 	now = clock.Now()
-	fake.set("token-cswap-aff-b", cswapUsageBody(10, now.Add(2*time.Hour), 96, now.Add(4*24*time.Hour)))
-	fake.set("token-cswap-aff-c", cswapUsageBody(10, now.Add(2*time.Hour), 97, now.Add(24*time.Hour)))
+	fake.set("token-cswap-aff-b", cswapUsageBody(96, now.Add(3*time.Hour), 10, now.Add(4*24*time.Hour)))
+	fake.set("token-cswap-aff-c", cswapUsageBody(97, now.Add(4*time.Hour), 10, now.Add(24*time.Hour)))
 	pollNow(policy, manager.List())
 	if got := pick(session("s5")); got != "cswap-aff-a" {
 		t.Fatalf("s5 with everyone above the threshold = %q, want cswap-aff-a (soonest recovery)", got)
@@ -594,4 +593,101 @@ func authIDs(auths []*Auth) []string {
 		ids = append(ids, auth.ID)
 	}
 	return ids
+}
+
+// cswapWeeklyOnlyBody renders the usage shape of an account without a 5-hour limit.
+func cswapWeeklyOnlyBody(sevenDay float64, sevenReset time.Time) string {
+	return fmt.Sprintf(`{"five_hour":null,"seven_day":{"utilization":%g,"resets_at":%q}}`,
+		sevenDay, sevenReset.UTC().Format(time.RFC3339Nano))
+}
+
+func TestCswapPolicyWeeklyWindowRunsToTheLimit(t *testing.T) {
+	clock := &cswapTestClock{now: time.Now()}
+	fake, server := newCswapUsageServer(t)
+	selector := newCswapTestSelector(t, server, clock)
+	now := clock.Now()
+	auths := []*Auth{cswapTestAuth("a", now.Add(8*time.Hour)), cswapTestAuth("b", now.Add(8*time.Hour))}
+	// a has no 5-hour limit and resets first; b has more headroom.
+	fake.set("token-a", cswapWeeklyOnlyBody(50, now.Add(24*time.Hour)))
+	fake.set("token-b", cswapUsageBody(10, now.Add(2*time.Hour), 10, now.Add(4*24*time.Hour)))
+	pollNow(selector, auths)
+	if got := pickID(t, selector, cliproxyexecutor.Options{}, auths); got != "a" {
+		t.Fatalf("initial pick = %q, want a (soonest reset)", got)
+	}
+	// Past the 5-hour threshold a weekly window keeps the account in rotation.
+	clock.Advance(time.Minute)
+	fake.set("token-a", cswapWeeklyOnlyBody(99, now.Add(24*time.Hour)))
+	pollNow(selector, auths)
+	if got := pickID(t, selector, cliproxyexecutor.Options{}, auths); got != "a" {
+		t.Fatalf("a weekly at 99%%: pick = %q, want a", got)
+	}
+	// At the limit it escapes at once.
+	clock.Advance(time.Minute)
+	fake.set("token-a", cswapWeeklyOnlyBody(100, now.Add(24*time.Hour)))
+	pollNow(selector, auths)
+	if got := pickID(t, selector, cliproxyexecutor.Options{}, auths); got != "b" {
+		t.Fatalf("a weekly at 100%%: pick = %q, want b", got)
+	}
+}
+
+func TestCswapPolicyClearsQuotaCooldownAfterEarlyReset(t *testing.T) {
+	ctx := context.Background()
+	clock := &cswapTestClock{now: time.Now()}
+	fake, server := newCswapUsageServer(t)
+	policy := newCswapTestSelector(t, server, clock)
+	manager := NewManager(nil, nil, nil)
+	manager.SetSelector(policy)
+	manager.RegisterExecutor(schedulerTestExecutor{provider: "claude"})
+	// newCswapTestSelector keeps the poller from starting, so wire the reset by hand.
+	policy.resetQuota = func(authID string) error {
+		_, _, errReset := manager.ResetQuota(ctx, authID)
+		return errReset
+	}
+	now := clock.Now()
+	for _, id := range []string{"cswap-q-a", "cswap-q-b"} {
+		if _, errRegister := manager.Register(WithSkipPersist(ctx), cswapTestAuth(id, now.Add(8*time.Hour))); errRegister != nil {
+			t.Fatalf("Register(%s): %v", id, errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: cswapTestModel}})
+		authID := id
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	}
+	weekReset := now.Add(36 * time.Hour)
+	fake.set("token-cswap-q-a", cswapWeeklyOnlyBody(99, weekReset))
+	fake.set("token-cswap-q-b", cswapUsageBody(10, now.Add(2*time.Hour), 10, now.Add(5*24*time.Hour)))
+	pollNow(policy, manager.List())
+	pick := func() string {
+		t.Helper()
+		picked, _, errPick := manager.pickNext(ctx, "claude", cswapTestModel, cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickNext: %v", errPick)
+		}
+		return picked.ID
+	}
+	if got := pick(); got != "cswap-q-a" {
+		t.Fatalf("initial pick = %q, want cswap-q-a", got)
+	}
+	// a hits its weekly limit: the manager cools it down until the weekly reset.
+	retry := weekReset.Sub(time.Now())
+	manager.MarkResult(ctx, Result{
+		AuthID: "cswap-q-a", Provider: "claude", Model: cswapTestModel, CredentialScope: true, RetryAfter: &retry,
+		Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate_limit_error"},
+	})
+	if got := pick(); got != "cswap-q-b" {
+		t.Fatalf("after 429: pick = %q, want cswap-q-b", got)
+	}
+	// A poll that agrees with the limit keeps the cooldown.
+	clock.Advance(time.Minute)
+	fake.set("token-cswap-q-a", cswapWeeklyOnlyBody(100, weekReset))
+	pollNow(policy, manager.List())
+	if got := pick(); got != "cswap-q-b" {
+		t.Fatalf("poll at 100%%: pick = %q, want cswap-q-b", got)
+	}
+	// Anthropic resets a's limits early: the next poll clears the cooldown.
+	clock.Advance(time.Minute)
+	fake.set("token-cswap-q-a", cswapWeeklyOnlyBody(0, weekReset))
+	pollNow(policy, manager.List())
+	if got := pick(); got != "cswap-q-a" {
+		t.Fatalf("after early reset: pick = %q, want cswap-q-a", got)
+	}
 }

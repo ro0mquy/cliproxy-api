@@ -185,8 +185,10 @@ routing:
   # CPA preserves the retained credential and concurrency slot instead of redispatching each turn.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
   # cswap-policy polls each Claude OAuth account's 5-hour, 7-day, and per-model weekly
-  # usage from Anthropic in the background. An account leaves rotation when a window
-  # reaches the threshold and returns once that window drops hysteresis-pct below it.
+  # usage from Anthropic in the background. An account leaves rotation when its 5-hour
+  # window reaches the threshold, or a weekly window reaches 100%, and returns once that
+  # window drops hysteresis-pct below it. A quota cooldown from a 429 is cleared when a
+  # later poll shows the account below threshold - hysteresis-pct (an early reset).
   # New sessions go to the healthy account whose 7-day window resets soonest. Pair it
   # with session-affinity: true so conversations keep their account while it is healthy.
   # Other providers are rotated round-robin.
