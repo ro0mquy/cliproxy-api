@@ -924,9 +924,9 @@ type sessionEligibilityFilter interface {
 }
 
 // authListBinder is implemented by selectors that read credentials outside Pick.
-// The manager binds its credential list when it installs the selector.
+// The manager binds its credential list and its quota reset when it installs the selector.
 type authListBinder interface {
-	bindAuthList(list func() []*Auth)
+	bindAuthList(list func() []*Auth, resetQuota func(authID string) error)
 }
 
 func (s *SessionAffinitySelector) sessionEligible(provider, model string, auths []*Auth) []*Auth {
@@ -936,9 +936,9 @@ func (s *SessionAffinitySelector) sessionEligible(provider, model string, auths 
 	return auths
 }
 
-func (s *SessionAffinitySelector) bindAuthList(list func() []*Auth) {
+func (s *SessionAffinitySelector) bindAuthList(list func() []*Auth, resetQuota func(authID string) error) {
 	if binder, ok := s.fallback.(authListBinder); ok {
-		binder.bindAuthList(list)
+		binder.bindAuthList(list, resetQuota)
 	}
 }
 
