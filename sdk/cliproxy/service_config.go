@@ -86,6 +86,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 			Threshold:     cfg.Routing.CswapPolicy.Threshold,
 			HysteresisPct: cfg.Routing.CswapPolicy.HysteresisPct,
 			Cooldown:      time.Duration(cfg.Routing.CswapPolicy.CooldownSeconds) * time.Second,
+			UserAgent:     "claude-cli/" + helps.DefaultClaudeVersion(cfg) + " (external, cli)",
 		}
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
