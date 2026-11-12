@@ -66,7 +66,7 @@ const (
 	cswapUsageEndpoint         = "https://api.anthropic.com/api/oauth/usage"
 	cswapOAuthBetaHeader       = "oauth-2025-04-20"
 	cswapMaxModelKeys          = 256
-	cswapClaudeCodeUserAgent   = "claude-cli/2.1.280 (external, cli)" // executor default, helps/claude_device_profile.go
+	cswapClaudeCodeUserAgent   = "claude-cli/2.1.321 (external, cli)" // fallback; the service passes the executor's fingerprint
 	cswapStrategyLogPrefix     = "cswap-policy"
 	cswapWindowFiveHour        = "5h"
 	cswapWindowSevenDay        = "7d"
@@ -83,9 +83,15 @@ type CswapPolicyConfig struct {
 	HysteresisPct float64
 	// Cooldown bounds how often the preferred account changes voluntarily.
 	Cooldown time.Duration
+	// UserAgent is sent on usage polls. It should match the Claude Code
+	// version the executor presents on inference for the same accounts.
+	UserAgent string
 }
 
 func (c CswapPolicyConfig) normalized() CswapPolicyConfig {
+	if strings.TrimSpace(c.UserAgent) == "" {
+		c.UserAgent = cswapClaudeCodeUserAgent
+	}
 	if c.Threshold <= 0 {
 		c.Threshold = CswapDefaultThreshold
 	}
@@ -820,7 +826,7 @@ func (s *CswapPolicySelector) fetchUsage(token string) (*cswapUsage, string, *ti
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-beta", cswapOAuthBetaHeader)
-	req.Header.Set("User-Agent", cswapClaudeCodeUserAgent)
+	req.Header.Set("User-Agent", s.cfg.UserAgent)
 	resp, errDo := s.httpClient.Do(req)
 	if errDo != nil {
 		var netErr net.Error
