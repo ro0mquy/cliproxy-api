@@ -75,3 +75,15 @@ func TestApplyManagerConfigStopsReplacedServiceAffinitySelector(t *testing.T) {
 		t.Fatal("expected replaced selector to be stopped during routing config apply")
 	}
 }
+
+// The cswap usage poller must present the same Claude Code version as the
+// executor does on inference for the same accounts.
+func TestCswapPolicyUsagePollerUsesExecutorClaudeVersion(t *testing.T) {
+	state := normalizedRoutingRuntimeState(&internalconfig.Config{
+		Routing:              internalconfig.RoutingConfig{Strategy: "cswap-policy"},
+		ClaudeHeaderDefaults: internalconfig.ClaudeHeaderDefaults{UserAgent: "claude-cli/9.8.7 (external, cli)"},
+	})
+	if got, want := state.cswapPolicy.UserAgent, "claude-cli/9.8.7 (external, cli)"; got != want {
+		t.Fatalf("cswap usage user agent = %q, want %q", got, want)
+	}
+}
