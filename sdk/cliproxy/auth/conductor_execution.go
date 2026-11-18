@@ -291,6 +291,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 		return cliproxyexecutor.Response{}, markContinuityTerminatedError(termErr)
 	}
+	m.recheckExhaustedClaudeQuota(ctx, normalized, retryModel, opts)
 	for attempt := 0; ; attempt++ {
 		if m.continuityDeadlineExceeded(continuitySession) {
 			continuitySession.budgetExhausted = true
@@ -442,6 +443,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	var preferredUpstreamErr error
 	var selectionCooldownDeadline time.Time
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
+	m.recheckExhaustedClaudeQuota(ctx, normalized, retryModel, opts)
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
@@ -537,6 +539,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, termErr
 	}
 	_, shareStreamAttempts := m.canRunCodexContinuity(ctx, normalized)
+	m.recheckExhaustedClaudeQuota(ctx, normalized, retryModel, opts)
 	attempt := 0
 	if shareStreamAttempts {
 		attempt = continuitySession.codexAttemptsUsed

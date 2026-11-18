@@ -766,6 +766,57 @@ func (m *Manager) bindSelectorAuthList(selector Selector) {
 	}
 }
 
+// recheckExhaustedClaudeQuota runs once at the request boundary, not on each
+// internal retry. Healthy pools keep the ordinary no-I/O selection path.
+func (m *Manager) recheckExhaustedClaudeQuota(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options) {
+	if m.HomeEnabled() || m.hasPluginScheduler() || ctx.Err() != nil {
+		return
+	}
+	selector := m.Selector()
+	if affinity, ok := selector.(*SessionAffinitySelector); ok {
+		selector = affinity.fallback
+	}
+	policy, ok := selector.(*CswapPolicySelector)
+	if !ok {
+		return
+	}
+	providerSet := make(map[string]bool, len(providers))
+	for _, provider := range providers {
+		providerSet[canonicalSchedulingProvider(provider)] = true
+	}
+	if !providerSet["claude"] {
+		return
+	}
+	auths := m.List()
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	pinned := pinnedAuthIDFromMetadata(opts.Metadata)
+	var candidates []*Auth
+	hasQuotaCooldown := false
+	now := time.Now()
+	m.mu.RLock()
+	for _, auth := range auths {
+		provider := canonicalSchedulingProvider(executorKeyFromAuth(auth))
+		if !providerSet[provider] || auth.Disabled || auth.Status == StatusDisabled || !eligibility.allows(auth) {
+			continue
+		}
+		if pinned != "" && auth.ID != pinned {
+			continue
+		}
+		if _, registered := m.executorLocked(provider); !registered || !m.authSupportsRouteModel(registry.GetGlobalRegistry(), auth, model) {
+			continue
+		}
+		candidates = append(candidates, auth)
+		if isCswapCandidate(auth) && hasCswapQuotaCooldown(auth, now) {
+			hasQuotaCooldown = true
+		}
+	}
+	_, errAvailable := m.availableAuthsForRouteModelForRequest(ctx, candidates, "mixed", model, now, true, opts.Headers)
+	m.mu.RUnlock()
+	if hasQuotaCooldown && isAuthUnavailableError(errAvailable) {
+		policy.recheckQuota(ctx, auths)
+	}
+}
+
 // Selector returns the current credential selector.
 func (m *Manager) Selector() Selector {
 	if m == nil {
