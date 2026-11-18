@@ -219,6 +219,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	var preferredUpstreamErr error
 	var terminalRoundRejectedByScheduler bool
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
+	m.recheckExhaustedClaudeQuota(ctx, normalized, retryModel, opts)
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
@@ -290,6 +291,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	var lastErr error
 	var preferredUpstreamErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
+	m.recheckExhaustedClaudeQuota(ctx, normalized, retryModel, opts)
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
@@ -356,6 +358,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	var terminalRoundRejectedByScheduler bool
 	homeRetryLimit := -1
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
+	m.recheckExhaustedClaudeQuota(ctx, normalized, retryModel, opts)
 	attempt := 0
 	retryRoundPending := false
 	retryRoundWaited := false
