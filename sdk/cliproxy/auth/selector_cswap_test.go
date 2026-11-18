@@ -2,12 +2,16 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -690,4 +694,197 @@ func TestCswapPolicyClearsQuotaCooldownAfterEarlyReset(t *testing.T) {
 	if got := pick(); got != "cswap-q-a" {
 		t.Fatalf("after early reset: pick = %q, want cswap-q-a", got)
 	}
+}
+
+type cswapRecoveryExecutor struct{ schedulerTestExecutor }
+
+func (cswapRecoveryExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+}
+
+func (e cswapRecoveryExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return e.Execute(ctx, auth, req, opts)
+}
+
+func (cswapRecoveryExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID)}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func TestCswapPolicyRequestRechecksExhaustedSubscriptions(t *testing.T) {
+	for _, mode := range []string{"execute", "stream", "count"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			clock := &cswapTestClock{now: time.Now()}
+			fake, server := newCswapUsageServer(t)
+			policy := newCswapTestSelector(t, server, clock)
+			affinity := NewSessionAffinitySelector(policy)
+			t.Cleanup(affinity.Stop)
+			manager := NewManager(nil, affinity, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			manager.RegisterExecutor(cswapRecoveryExecutor{schedulerTestExecutor{provider: "claude"}})
+			// Tests suppress the background loop; use the same reset callback as production.
+			policy.resetQuota = func(id string) error {
+				_, _, err := manager.ResetQuota(ctx, id)
+				return err
+			}
+			now := clock.Now()
+			ids := []string{"request-" + mode + "-a", "request-" + mode + "-b", "request-" + mode + "-unsubscribed"}
+			for _, id := range ids {
+				if _, err := manager.Register(WithSkipPersist(ctx), cswapTestAuth(id, now.Add(8*time.Hour))); err != nil {
+					t.Fatal(err)
+				}
+				registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: cswapTestModel}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+				fake.set("token-"+id, cswapWeeklyOnlyBody(100, now.Add(24*time.Hour)))
+				retry := 24 * time.Hour
+				failure := &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate_limit_error"}
+				quota := true
+				if id == ids[2] {
+					failure = &Error{HTTPStatus: http.StatusPaymentRequired, Message: "payment_required"}
+					quota = false
+					fake.set("token-"+id, cswapWeeklyOnlyBody(0, now.Add(24*time.Hour)))
+				}
+				manager.MarkResult(ctx, Result{
+					AuthID: id, Provider: "claude", Model: cswapTestModel, CredentialScope: quota, RetryAfter: &retry,
+					Error: failure,
+				})
+			}
+			pollNow(policy, manager.List())
+			request := func() (string, error) {
+				req := cliproxyexecutor.Request{Model: cswapTestModel}
+				opts := cliproxyexecutor.Options{}
+				if mode == "stream" {
+					result, err := manager.ExecuteStream(ctx, []string{"claude"}, req, opts)
+					if err != nil {
+						return "", err
+					}
+					var payload strings.Builder
+					for chunk := range result.Chunks {
+						if chunk.Err != nil {
+							return "", chunk.Err
+						}
+						payload.Write(chunk.Payload)
+					}
+					return payload.String(), nil
+				}
+				call := manager.Execute
+				if mode == "count" {
+					call = manager.ExecuteCount
+				}
+				result, err := call(ctx, []string{"claude"}, req, opts)
+				return string(result.Payload), err
+			}
+			assertPolls := func(want int) {
+				t.Helper()
+				for _, id := range ids {
+					if got := fake.callCount("token-" + id); got != want {
+						t.Errorf("usage checks for %s = %d, want %d", id, got, want)
+					}
+				}
+			}
+			if _, err := request(); err == nil {
+				t.Fatal("request succeeded although both subscriptions remain exhausted and the third is unpaid")
+			}
+			assertPolls(2)
+			// No clock advance: the next request must ignore the poll schedule.
+			// A failed quota endpoint on a must not prevent b from recovering.
+			fake.fail("token-"+ids[0], http.StatusForbidden, "")
+			fake.set("token-"+ids[1], cswapWeeklyOnlyBody(72, now.Add(24*time.Hour)))
+			if got, err := request(); err != nil || got != ids[1] {
+				t.Fatalf("request after early reset = %q, %v; want %s", got, err, ids[1])
+			}
+			assertPolls(3)
+			if got, err := request(); err != nil || got != ids[1] {
+				t.Fatalf("healthy request = %q, %v; want %s", got, err, ids[1])
+			}
+			assertPolls(3)
+		})
+	}
+}
+
+type cswapBlockingUsageTransport struct {
+	calls   atomic.Int32
+	release chan struct{}
+	body    string
+}
+
+func (tr *cswapBlockingUsageTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	tr.calls.Add(1)
+	select {
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	case <-tr.release:
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tr.body))}, nil
+	}
+}
+
+func TestCswapPolicyConcurrentRequestRecoveryAndCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Now()
+		policy := NewCswapPolicySelector(CswapPolicyConfig{})
+		policy.startOnce.Do(func() {})
+		defer policy.Stop()
+		transport := &cswapBlockingUsageTransport{
+			release: make(chan struct{}), body: cswapWeeklyOnlyBody(40, now.Add(24*time.Hour)),
+		}
+		policy.httpClient = &http.Client{Transport: transport}
+		affinity := NewSessionAffinitySelector(policy)
+		defer affinity.Stop()
+		manager := NewManager(nil, affinity, nil)
+		manager.SetRetryConfig(0, 0, 0)
+		manager.RegisterExecutor(cswapRecoveryExecutor{schedulerTestExecutor{provider: "claude"}})
+		policy.resetQuota = func(id string) error {
+			_, _, err := manager.ResetQuota(context.Background(), id)
+			return err
+		}
+		for _, id := range []string{"concurrent-recovery-a", "concurrent-recovery-b"} {
+			if _, err := manager.Register(WithSkipPersist(context.Background()), cswapTestAuth(id, now.Add(8*time.Hour))); err != nil {
+				t.Fatal(err)
+			}
+			registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: cswapTestModel}})
+			defer registry.GetGlobalRegistry().UnregisterClient(id)
+			retry := 24 * time.Hour
+			manager.MarkResult(context.Background(), Result{
+				AuthID: id, Provider: "claude", Model: cswapTestModel, CredentialScope: true, RetryAfter: &retry,
+				Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate_limit_error"},
+			})
+		}
+		request := func(ctx context.Context) error {
+			resp, err := manager.Execute(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: cswapTestModel}, cliproxyexecutor.Options{})
+			if err == nil && !strings.HasPrefix(string(resp.Payload), "concurrent-recovery-") {
+				return fmt.Errorf("unexpected response %q", resp.Payload)
+			}
+			return err
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		canceled := make(chan error, 1)
+		go func() { canceled <- request(ctx) }()
+		synctest.Wait()
+		const others = 8
+		results := make(chan error, others)
+		for range others {
+			go func() { results <- request(context.Background()) }()
+		}
+		synctest.Wait()
+		if got := transport.calls.Load(); got != 2 {
+			t.Errorf("concurrent quota fetches = %d, want one per subscription", got)
+		}
+		cancel()
+		synctest.Wait()
+		if err := <-canceled; !errors.Is(err, context.Canceled) {
+			t.Errorf("canceled request = %v, want context.Canceled", err)
+		}
+		close(transport.release)
+		for range others {
+			if err := <-results; err != nil {
+				t.Errorf("shared recovery failed: %v", err)
+			}
+		}
+		if got := transport.calls.Load(); got != 2 {
+			t.Errorf("quota fetches after recovery = %d, want 2", got)
+		}
+	})
 }
