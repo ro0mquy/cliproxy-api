@@ -17,6 +17,7 @@ import (
 
 	gjson "github.com/MoeForge/moego/ojson"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
@@ -136,6 +137,7 @@ type CswapPolicySelector struct {
 	httpClient *http.Client
 	usageURL   string
 	resetQuota func(authID string) error
+	polls      singleflight.Group
 	now        func() time.Time
 	randFloat  func() float64
 
@@ -739,16 +741,57 @@ func (s *CswapPolicySelector) pollOnce(auths []*Auth) {
 	if !ok {
 		return
 	}
-	usage, kind, retryAfter, errFetch := s.fetchUsage(target.token)
-	recovered, pct := s.recordPoll(target.id, usage, kind, retryAfter, errFetch)
-	if !recovered || !target.quotaCooldown || s.resetQuota == nil {
-		return
+	<-s.pollTarget(target)
+}
+
+// recheckQuota ignores the background schedule when a request has no available
+// credential. Concurrent requests and the background poller share in-flight
+// checks per account; a later request starts a new check, even after a failure.
+func (s *CswapPolicySelector) recheckQuota(ctx context.Context, auths []*Auth) {
+	now := s.now()
+	var pending []<-chan singleflight.Result
+	for _, auth := range auths {
+		if ctx.Err() != nil {
+			return
+		}
+		if !isCswapCandidate(auth) || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
+			continue
+		}
+		s.mu.Lock()
+		if s.accounts[auth.ID] == nil {
+			s.accounts[auth.ID] = &cswapAccount{out: make(map[string]bool)}
+		}
+		s.mu.Unlock()
+		pending = append(pending, s.pollTarget(cswapPollTarget{
+			id: auth.ID, token: authAccessToken(auth), quotaCooldown: hasCswapQuotaCooldown(auth, now),
+		}))
 	}
-	if errReset := s.resetQuota(target.id); errReset != nil {
-		log.Warnf("%s: clear quota cooldown failed | auth=%s err=%v", cswapStrategyLogPrefix, target.id, errReset)
-		return
+	for _, done := range pending {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+		}
 	}
-	log.Infof("%s: cleared quota cooldown | auth=%s usage=%.1f%%", cswapStrategyLogPrefix, target.id, pct)
+}
+
+func (s *CswapPolicySelector) pollTarget(target cswapPollTarget) <-chan singleflight.Result {
+	return s.polls.DoChan(target.id, func() (any, error) {
+		usage, kind, retryAfter, errFetch := s.fetchUsage(target.token)
+		recovered, pct := s.recordPoll(target.id, usage, kind, retryAfter, errFetch)
+		if !recovered || !target.quotaCooldown || s.resetQuota == nil {
+			return nil, nil
+		}
+		if errReset := s.resetQuota(target.id); errReset != nil {
+			log.Warnf("%s: clear quota cooldown failed | auth=%s err=%v", cswapStrategyLogPrefix, target.id, errReset)
+			return nil, errReset
+		}
+		log.Infof("%s: cleared quota cooldown | auth=%s usage=%.1f%%", cswapStrategyLogPrefix, target.id, pct)
+		return nil, nil
+	})
 }
 
 // hasCswapQuotaCooldown reports whether the manager holds the credential, or one
@@ -808,8 +851,8 @@ func (s *CswapPolicySelector) nextPollTarget(auths []*Auth) (cswapPollTarget, bo
 }
 
 // fetchUsage mirrors cswap's oauth.request_usage_data and _classify_usage_error.
-// The poll is background credential-quota work, never on a request path, so it
-// carries its own deadline.
+// Quota checks carry their own deadline, including those shared by waiting
+// requests, so cancelling one caller does not cancel another caller's check.
 func (s *CswapPolicySelector) fetchUsage(token string) (*cswapUsage, string, *time.Duration, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cswapFetchTimeout)
 	defer cancel()
