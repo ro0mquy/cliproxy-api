@@ -20,6 +20,27 @@ import (
 
 const cswapTestModel = "claude-opus-5-5"
 
+func TestCswapUsageRateLimitBackoff(t *testing.T) {
+	short, long := 3*time.Second, 90*time.Minute
+	for _, tc := range []struct {
+		name       string
+		failures   int
+		retryAfter *time.Duration
+		want       time.Duration
+	}{
+		{"first short hint", 1, &short, 30 * time.Second},
+		{"repeated short hint", 438, &short, 2 * time.Minute},
+		{"missing hint", 438, nil, 2 * time.Minute},
+		{"long provider hint", 438, &long, 90 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cswapFailureBackoff(tc.failures, tc.retryAfter, true); got != tc.want {
+				t.Fatalf("backoff = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 type cswapTestClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -423,8 +444,8 @@ func TestCswapPolicyUsageBackoff(t *testing.T) {
 		quiet      time.Duration // no poll before this
 		next       time.Duration // a poll by this
 	}{
-		{name: "429 saturated edge", status: http.StatusTooManyRequests, retryAfter: "0", quiet: 299 * time.Second, next: 301 * time.Second},
-		{name: "429 hour block takes the margin", status: http.StatusTooManyRequests, retryAfter: "3600", quiet: 4499 * time.Second, next: 4501 * time.Second},
+		{name: "429 zero hint uses local backoff", status: http.StatusTooManyRequests, retryAfter: "0", quiet: 29 * time.Second, next: 31 * time.Second},
+		{name: "429 hour hint honored without padding", status: http.StatusTooManyRequests, retryAfter: "3600", quiet: 3599 * time.Second, next: 3601 * time.Second},
 		{name: "503 hour block has no margin", status: http.StatusServiceUnavailable, retryAfter: "3600", quiet: 3599 * time.Second, next: 3601 * time.Second},
 		{name: "500 without retry-after", status: http.StatusInternalServerError, quiet: 29 * time.Second, next: 31 * time.Second},
 		{name: "bad response", body: "not json", quiet: 29 * time.Second, next: 31 * time.Second},
