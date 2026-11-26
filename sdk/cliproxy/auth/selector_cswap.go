@@ -57,9 +57,7 @@ const (
 	// Failure backoff and trust (usage_store.py).
 	cswapBackoffBase           = 30 * time.Second
 	cswapBackoffCap            = 600 * time.Second
-	cswapEdgeBackoff           = 300 * time.Second
-	cswapRetryAfterMargin      = 900 * time.Second
-	cswapRetryAfterCap429      = 4500 * time.Second
+	cswapRateLimitBackoffCap   = 2 * time.Minute
 	cswapRetryAfterCapOther    = 3600 * time.Second
 	cswapTrustMaxAge           = time.Hour
 	cswapRateLimitTrustMaxAge  = 2 * time.Hour
@@ -1085,25 +1083,16 @@ func cswapFailureBackoff(failures int, retryAfter *time.Duration, rateLimited bo
 		shift = 5
 	}
 	computed := minDuration(cswapBackoffBase*time.Duration(1<<shift), cswapBackoffCap)
-	if retryAfter == nil {
-		return computed
-	}
-	if *retryAfter == 0 {
-		if !rateLimited {
-			return computed
-		}
-		return minDuration(maxDuration(computed, cswapEdgeBackoff), cswapBackoffCap)
-	}
-	asked := *retryAfter
-	if asked > cswapBackoffCap && rateLimited {
-		asked += cswapRetryAfterMargin
-	}
 	if rateLimited {
-		asked = minDuration(asked, cswapRetryAfterCap429)
-	} else {
-		asked = minDuration(asked, cswapRetryAfterCapOther)
+		// Cap our own backoff, not the wait requested by the provider.
+		computed = minDuration(computed, cswapRateLimitBackoffCap)
+		if retryAfter != nil {
+			return maxDuration(computed, *retryAfter)
+		}
+	} else if retryAfter != nil {
+		return maxDuration(computed, minDuration(*retryAfter, cswapRetryAfterCapOther))
 	}
-	return maxDuration(asked, computed)
+	return computed
 }
 
 func minDuration(a, b time.Duration) time.Duration {
